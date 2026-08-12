@@ -16,10 +16,12 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
+	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 	"rsc.io/qr"
 )
@@ -110,6 +112,14 @@ func main() {
 		log.Fatal("❌ Для авторизации по коду укажите PHONE в .env")
 	}
 
+	proxyInfo, err := setupProxy()
+	if err != nil {
+		log.Fatalf("❌ Прокси: %v", err)
+	}
+	if proxyInfo != "" {
+		log.Printf("🌐 Подключение через прокси: %s", proxyInfo)
+	}
+
 	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -118,6 +128,8 @@ func main() {
 		SessionStorage: &session.FileStorage{Path: "session.json"},
 		UpdateHandler:  dispatcher,
 		Logger:         zap.NewNop(),
+		// proxy.Dial ходит через ALL_PROXY/NO_PROXY; без них — напрямую.
+		Resolver: dcs.Plain(dcs.PlainOptions{Dial: proxy.Dial}),
 	})
 
 	if err := client.Run(appCtx, func(ctx context.Context) error {
