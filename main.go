@@ -6,22 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	gotdlog "github.com/gotd/log"
+	"github.com/gotd/log/logslog"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
-	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"github.com/joho/godotenv"
-	"go.uber.org/zap"
-	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 	"rsc.io/qr"
 )
@@ -90,6 +90,18 @@ const chatsPerPage = 25
 // errAborted возвращается, когда пользователь сам прервал выбор
 var errAborted = errors.New("выбор отменён")
 
+// gotdLogger отдаёт логгер для gotd. По умолчанию показываем только
+// предупреждения и ошибки: без них сбои подключения не видны вообще и
+// выглядят как зависание. С --verbose включается полная отладка.
+func gotdLogger(verbose bool) gotdlog.Logger {
+	level := slog.LevelWarn
+	if verbose {
+		level = slog.LevelDebug
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	return logslog.New(slog.New(handler))
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -102,9 +114,13 @@ func main() {
 	}
 
 	useCodeAuth := false
+	verbose := false
 	for _, arg := range os.Args[1:] {
-		if arg == "--code-auth" {
+		switch arg {
+		case "--code-auth":
 			useCodeAuth = true
+		case "--verbose", "-v":
+			verbose = true
 		}
 	}
 
@@ -112,24 +128,37 @@ func main() {
 		log.Fatal("❌ Для авторизации по коду укажите PHONE в .env")
 	}
 
+	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	mode, err := transportModeFromEnv()
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+
 	proxyInfo, err := setupProxy()
 	if err != nil {
 		log.Fatalf("❌ Прокси: %v", err)
 	}
 	if proxyInfo != "" {
-		log.Printf("🌐 Подключение через прокси: %s", proxyInfo)
+		log.Printf("🌐 Прокси: %s", proxyInfo)
+		log.Println("   Проверяю доступность Telegram через прокси...")
 	}
 
-	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	// Транспорт выбираем и проверяем до запуска клиента: иначе gotd молча
+	// уходит в бесконечный цикл переподключений, и снаружи это выглядит как
+	// зависание.
+	resolver, err := pickResolver(appCtx, mode, proxyInfo != "")
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
 
 	dispatcher := tg.NewUpdateDispatcher()
 	client := telegram.NewClient(appID, appHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: "session.json"},
 		UpdateHandler:  dispatcher,
-		Logger:         zap.NewNop(),
-		// proxy.Dial ходит через ALL_PROXY/NO_PROXY; без них — напрямую.
-		Resolver: dcs.Plain(dcs.PlainOptions{Dial: proxy.Dial}),
+		Logger:         gotdLogger(verbose),
+		Resolver:       resolver,
 	})
 
 	if err := client.Run(appCtx, func(ctx context.Context) error {

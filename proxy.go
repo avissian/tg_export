@@ -10,11 +10,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gotd/td/telegram/dcs"
 	"golang.org/x/net/proxy"
 )
+
+// proxyConnectTimeout — сколько ждём соединения с Telegram через прокси
+// при стартовой проверке.
+const proxyConnectTimeout = 15 * time.Second
 
 // proxyEnvVars — переменные с адресом прокси в порядке приоритета.
 // Сам x/net/proxy читает только ALL_PROXY (и NO_PROXY для исключений),
@@ -46,7 +53,7 @@ func setupProxy() (string, error) {
 
 	u, err := parseProxyURL(raw)
 	if err != nil {
-		return "", fmt.Errorf("%s=%q: %w", envName, raw, err)
+		return "", fmt.Errorf("%s=%q: %w%s", envName, raw, err, specialCharsHint(raw))
 	}
 
 	// FromEnvironment при неразобранном адресе молча возвращает Direct,
@@ -61,6 +68,146 @@ func setupProxy() (string, error) {
 
 	// Redacted() скрывает пароль, чтобы тот не утёк в лог.
 	return fmt.Sprintf("%s (из %s)", u.Redacted(), envName), nil
+}
+
+// checkProxy пробует дойти через прокси до дата-центра Telegram.
+//
+// Без этой проверки неработающий прокси не даёт никакой обратной связи: gotd
+// упирается в таймаут дозвона (35 c по умолчанию) и молча повторяет попытку —
+// снаружи это выглядит как бесконечное зависание на старте.
+func checkProxy(ctx context.Context, timeout time.Duration) error {
+	addrs, err := telegramProbeAddrs()
+	if err != nil {
+		return err
+	}
+
+	// Адреса пробуем разом: последовательный перебор занимал бы timeout на
+	// каждый, а нам достаточно любого дозвонившегося.
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	type result struct {
+		addr string
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
+		go func(addr string) {
+			conn, err := proxy.Dial(attemptCtx, "tcp", addr)
+			results <- result{addr: addr, conn: conn, err: err}
+		}(addr)
+	}
+
+	var failures []string
+	var ok bool
+	for range addrs {
+		r := <-results
+		switch {
+		case r.err != nil:
+			failures = append(failures, fmt.Sprintf("   • %s — %v", r.addr, r.err))
+		case ok: // уже есть рабочее соединение, это закрываем
+			r.conn.Close()
+		default:
+			ok = true
+			r.conn.Close()
+		}
+	}
+	if ok {
+		return nil
+	}
+	if ctx.Err() != nil { // Ctrl+C
+		return ctx.Err()
+	}
+	sort.Strings(failures)
+
+	return fmt.Errorf("прокси не смог подключиться ни к одному дата-центру Telegram:\n%s\n"+
+		"   Для MTProto нужен SOCKS5 или HTTP-прокси с разрешённым CONNECT на порт 443.\n"+
+		"   Проверить прокси отдельно: ALL_PROXY=<тот же адрес> curl -sS https://ifconfig.me\n"+
+		"   Подробный лог: запустите с ключом -v\n"+
+		"   Отключить прокси: уберите ALL_PROXY/HTTPS_PROXY/HTTP_PROXY из .env и окружения",
+		strings.Join(failures, "\n"))
+}
+
+// telegramProbeAddrs возвращает адреса дата-центров Telegram для проверки связи:
+// сначала Static (они и предназначены для работы через прокси), потом обычные.
+// Один недоступный адрес ещё не значит, что прокси нерабочий, поэтому пробуем
+// несколько и по разным дата-центрам.
+func telegramProbeAddrs() ([]string, error) {
+	var static, regular []string
+	seen := make(map[string]bool)
+
+	for _, dc := range []int{2, 4} {
+		for _, o := range dcs.FindPrimaryDCs(dcs.Prod().Options, dc, false) {
+			// IPv6 пропускаем: далеко не каждый прокси его умеет, и отказ
+			// в IPv6 ничего не говорит о работоспособности прокси.
+			if o.MediaOnly || o.CDN || o.TCPObfuscatedOnly || o.Ipv6 {
+				continue
+			}
+			addr := net.JoinHostPort(o.IPAddress, strconv.Itoa(o.Port))
+			if seen[addr] {
+				continue
+			}
+			seen[addr] = true
+			if o.Static {
+				static = append(static, addr)
+			} else {
+				regular = append(regular, addr)
+			}
+		}
+	}
+
+	addrs := append(static, regular...)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("не найден адрес дата-центра Telegram для проверки прокси")
+	}
+	if len(addrs) > 4 {
+		addrs = addrs[:4]
+	}
+	return addrs, nil
+}
+
+// specialCharsHint подсказывает про спецсимволы в пароле, если они похоже и
+// сломали разбор. В URL пароль — это часть адреса: `#`, `@`, `/`, `?`, `:`
+// нужно писать в процентной кодировке, иначе адрес обрывается на первом же
+// таком символе. Плюс `#` в .env без кавычек godotenv считает началом
+// комментария и отрезает остаток строки.
+func specialCharsHint(raw string) string {
+	// Отрезаем схему: `//` и `:` в ней законны.
+	rest := raw
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	// Хост от userinfo отделяет последняя `@`; спецсимволы ищем до неё.
+	userinfo := rest
+	if i := strings.LastIndex(rest, "@"); i >= 0 {
+		userinfo = rest[:i]
+	} else {
+		return ""
+	}
+
+	var found []string
+	for _, c := range []struct {
+		ch, enc string
+	}{
+		{"#", "%23"}, {"@", "%40"}, {"/", "%2F"}, {"?", "%3F"},
+	} {
+		if strings.Contains(userinfo, c.ch) {
+			found = append(found, c.ch+" → "+c.enc)
+		}
+	}
+	// Одна `:` разделяет логин и пароль, лишние — уже спецсимвол в пароле.
+	if strings.Count(userinfo, ":") > 1 {
+		found = append(found, ": → %3A")
+	}
+	if len(found) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("\n   Похоже, в логине или пароле есть спецсимволы — их нужно записать в\n"+
+		"   процентной кодировке: %s\n"+
+		"   А значение с `#` в .env ещё и берите в кавычки, иначе остаток строки\n"+
+		"   будет отброшен как комментарий.", strings.Join(found, ", "))
 }
 
 func lookupProxyEnv() (value, name string) {
