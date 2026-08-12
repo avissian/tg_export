@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -81,6 +82,12 @@ type ChatItem struct {
 	Type      string // "user", "chat", "channel"
 }
 
+// chatsPerPage — сколько диалогов показывать на одной странице списка
+const chatsPerPage = 25
+
+// errAborted возвращается, когда пользователь сам прервал выбор
+var errAborted = errors.New("выбор отменён")
+
 func main() {
 	_ = godotenv.Load()
 
@@ -147,13 +154,57 @@ func main() {
 			return fmt.Errorf("нет доступных диалогов")
 		}
 
-		sep := strings.Repeat("═", 68)
+		scanner := bufio.NewScanner(os.Stdin)
+
+		selected, err := selectChat(chats, scanner)
+		if err != nil {
+			if errors.Is(err, errAborted) {
+				log.Println("Выход без экспорта")
+				return nil
+			}
+			return err
+		}
+		fmt.Printf("\n✅ Выбран: %s\n", selected.Title)
+
+		limit, err := askMessageLimit(scanner)
+		if err != nil {
+			if errors.Is(err, errAborted) {
+				log.Println("Выход без экспорта")
+				return nil
+			}
+			return err
+		}
+		fmt.Println()
+
+		outDir := filepath.Join("exports", sanitizeName(selected.Title))
+		if err := os.MkdirAll(filepath.Join(outDir, "media"), 0o755); err != nil {
+			return fmt.Errorf("создание директории экспорта: %w", err)
+		}
+
+		return ExportChat(ctx, api, selected, outDir, limit)
+	}); err != nil && appCtx.Err() == nil {
+		log.Fatalf("❌ %v", err)
+	}
+}
+
+// selectChat показывает список диалогов постранично (по chatsPerPage штук)
+// и возвращает выбранный пользователем. Номера сквозные по всему списку.
+func selectChat(chats []ChatItem, scanner *bufio.Scanner) (ChatItem, error) {
+	totalPages := (len(chats) + chatsPerPage - 1) / chatsPerPage
+	sep := strings.Repeat("═", 68)
+	page := 0
+
+	for {
+		start := page * chatsPerPage
+		end := min(start+chatsPerPage, len(chats))
+
 		fmt.Printf("\n%s\n", sep)
-		fmt.Println("  Доступные диалоги:")
+		fmt.Printf("  Доступные диалоги: %d–%d из %d (страница %d/%d)\n",
+			start+1, end, len(chats), page+1, totalPages)
 		fmt.Printf("%s\n", sep)
-		for i, c := range chats {
+		for i := start; i < end; i++ {
 			var typeLabel string
-			switch c.Type {
+			switch chats[i].Type {
 			case "channel":
 				typeLabel = "[канал/супергруппа]"
 			case "chat":
@@ -161,30 +212,72 @@ func main() {
 			case "user":
 				typeLabel = "[личный чат]"
 			}
-			fmt.Printf("  %4d. %-48s %s\n", i+1, c.Title, typeLabel)
+			fmt.Printf("  %4d. %-48s %s\n", i+1, chats[i].Title, typeLabel)
 		}
 		fmt.Printf("%s\n", sep)
+
+		hints := []string{}
+		if page+1 < totalPages {
+			hints = append(hints, "n — следующая страница")
+		}
+		if page > 0 {
+			hints = append(hints, "p — предыдущая")
+		}
+		hints = append(hints, "q — выход")
+		fmt.Printf("  %s\n", strings.Join(hints, ", "))
 		fmt.Print("\nВведите номер чата для экспорта: ")
 
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		numStr := strings.TrimSpace(scanner.Text())
-		num, err := strconv.Atoi(numStr)
+		if !scanner.Scan() {
+			return ChatItem{}, errAborted
+		}
+		input := strings.TrimSpace(scanner.Text())
+
+		switch strings.ToLower(input) {
+		case "n", "+", "":
+			if page+1 < totalPages {
+				page++
+			} else {
+				fmt.Println("  ⚠️  Это последняя страница")
+			}
+			continue
+		case "p", "-":
+			if page > 0 {
+				page--
+			} else {
+				fmt.Println("  ⚠️  Это первая страница")
+			}
+			continue
+		case "q":
+			return ChatItem{}, errAborted
+		}
+
+		num, err := strconv.Atoi(input)
 		if err != nil || num < 1 || num > len(chats) {
-			return fmt.Errorf("неверный номер: %q", numStr)
+			fmt.Printf("  ⚠️  Неверный номер: %q (нужно 1–%d)\n", input, len(chats))
+			continue
 		}
+		return chats[num-1], nil
+	}
+}
 
-		selected := chats[num-1]
-		fmt.Printf("\n✅ Выбран: %s\n\n", selected.Title)
-
-		outDir := filepath.Join("exports", sanitizeName(selected.Title))
-		if err := os.MkdirAll(filepath.Join(outDir, "media"), 0o755); err != nil {
-			return fmt.Errorf("создание директории экспорта: %w", err)
+// askMessageLimit спрашивает, сколько последних сообщений экспортировать.
+// 0 означает всю историю.
+func askMessageLimit(scanner *bufio.Scanner) (int, error) {
+	for {
+		fmt.Print("Сколько последних сообщений экспортировать (0 — вся история): ")
+		if !scanner.Scan() {
+			return 0, errAborted
 		}
-
-		return ExportChat(ctx, api, selected, outDir)
-	}); err != nil && appCtx.Err() == nil {
-		log.Fatalf("❌ %v", err)
+		input := strings.TrimSpace(scanner.Text())
+		if strings.EqualFold(input, "q") {
+			return 0, errAborted
+		}
+		n, err := strconv.Atoi(input)
+		if err != nil || n < 0 {
+			fmt.Printf("  ⚠️  Нужно неотрицательное число, а не %q\n", input)
+			continue
+		}
+		return n, nil
 	}
 }
 

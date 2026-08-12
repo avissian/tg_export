@@ -17,6 +17,9 @@ import (
 	"github.com/gotd/td/tgerr"
 )
 
+// batchSize — максимальный размер одного запроса истории (ограничение API)
+const batchSize = 100
+
 // MessageJSON — структура одного сообщения в JSONL-файле
 type MessageJSON struct {
 	ID           int          `json:"id"`
@@ -38,11 +41,12 @@ type ForwardInfo struct {
 	Date     time.Time `json:"date"`
 }
 
-// ExportChat экспортирует все сообщения чата в директорию outDir.
-// Файлы: outDir/messages.jsonl (все сообщения от новых к старым),
+// ExportChat экспортирует сообщения чата в директорию outDir.
+// limit — сколько последних сообщений выгрузить, 0 означает всю историю.
+// Файлы: outDir/messages.jsonl (сообщения от новых к старым),
 //
 //	outDir/media/ (фото, видео, документы и т.д.)
-func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir string) error {
+func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir string, limit int) error {
 	msgFile, err := os.Create(filepath.Join(outDir, "messages.jsonl"))
 	if err != nil {
 		return fmt.Errorf("создание messages.jsonl: %w", err)
@@ -58,6 +62,11 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 
 	log.Printf("📥 Начинаю экспорт: %s", chat.Title)
 	log.Printf("   Директория: %s", outDir)
+	if limit > 0 {
+		log.Printf("   Лимит: %d последних сообщений", limit)
+	} else {
+		log.Println("   Лимит: вся история")
+	}
 	log.Println("   Сообщения сохраняются от новых к старым.")
 
 	for {
@@ -67,7 +76,16 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 		default:
 		}
 
-		resp, err := fetchHistoryWithRetry(ctx, api, chat.InputPeer, offsetID)
+		batchLimit := batchSize
+		if limit > 0 {
+			remaining := limit - totalMsgs
+			if remaining <= 0 {
+				break
+			}
+			batchLimit = min(remaining, batchSize)
+		}
+
+		resp, err := fetchHistoryWithRetry(ctx, api, chat.InputPeer, offsetID, batchLimit)
 		if err != nil {
 			return fmt.Errorf("получение истории: %w", err)
 		}
@@ -116,8 +134,8 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 
 			jmsg := buildMessageJSON(msg, userMap, chatNameMap)
 
-		// Медиа
-		if media, ok := msg.GetMedia(); ok {
+			// Медиа
+			if media, ok := msg.GetMedia(); ok {
 				relPath, mediaType, dlErr := downloadMedia(ctx, api, dl, media, outDir, msg.ID, chat.InputPeer)
 				if dlErr != nil {
 					log.Printf("⚠️  Медиа для сообщения %d: %v", msg.ID, dlErr)
@@ -133,10 +151,16 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 
 		totalMsgs += len(messages)
 		batchNum++
-		log.Printf("   Пакет %-4d → %d сообщений в пакете, всего: %d (последний ID: %d)",
-			batchNum, len(messages), totalMsgs, minID)
+		if limit > 0 {
+			log.Printf("   Пакет %-4d → %d сообщений в пакете, всего: %d из %d (последний ID: %d)",
+				batchNum, len(messages), totalMsgs, limit, minID)
+		} else {
+			log.Printf("   Пакет %-4d → %d сообщений в пакете, всего: %d (последний ID: %d)",
+				batchNum, len(messages), totalMsgs, minID)
+		}
 
-		if len(messages) < 100 {
+		// Ответ короче запрошенного — история кончилась
+		if len(messages) < batchLimit {
 			break
 		}
 		offsetID = minID
@@ -156,12 +180,12 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 
 // fetchHistoryWithRetry выполняет запрос истории с повтором при FLOOD_WAIT
 // и при обрыве соединения (engine forcibly closed).
-func fetchHistoryWithRetry(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, offsetID int) (tg.MessagesMessagesClass, error) {
+func fetchHistoryWithRetry(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, offsetID, limit int) (tg.MessagesMessagesClass, error) {
 	for attempt := 0; attempt < 10; attempt++ {
 		resp, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			OffsetID: offsetID,
-			Limit:    100,
+			Limit:    limit,
 		})
 		if err == nil {
 			return resp, nil
@@ -475,21 +499,21 @@ func extractDocFilename(doc *tg.Document, msgID int) string {
 // extensionFromMIME возвращает расширение файла по MIME-типу и атрибутам
 func extensionFromMIME(mimeType string, attrs []tg.DocumentAttributeClass) string {
 	knownExts := map[string]string{
-		"video/mp4":             ".mp4",
-		"video/webm":            ".webm",
-		"video/quicktime":       ".mov",
-		"audio/ogg":             ".ogg",
-		"audio/mpeg":            ".mp3",
-		"audio/mp4":             ".m4a",
-		"audio/aac":             ".aac",
-		"image/jpeg":            ".jpg",
-		"image/png":             ".png",
-		"image/gif":             ".gif",
-		"image/webp":            ".webp",
-		"application/pdf":       ".pdf",
-		"application/zip":       ".zip",
+		"video/mp4":               ".mp4",
+		"video/webm":              ".webm",
+		"video/quicktime":         ".mov",
+		"audio/ogg":               ".ogg",
+		"audio/mpeg":              ".mp3",
+		"audio/mp4":               ".m4a",
+		"audio/aac":               ".aac",
+		"image/jpeg":              ".jpg",
+		"image/png":               ".png",
+		"image/gif":               ".gif",
+		"image/webp":              ".webp",
+		"application/pdf":         ".pdf",
+		"application/zip":         ".zip",
 		"application/x-tgsticker": ".tgs",
-		"text/plain":            ".txt",
+		"text/plain":              ".txt",
 	}
 	if ext, ok := knownExts[mimeType]; ok {
 		return ext

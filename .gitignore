@@ -1,0 +1,46 @@
+# Собранные бинарники
+/tg_export
+/tg_export.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Артефакты сборки релизов
+/dist/
+*.tar.gz
+*.zip
+
+# Тесты и профилирование
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Локальное окружение Go
+go.work
+go.work.sum
+
+# Секреты и учётные данные
+.env
+.env.*
+!.env.example
+
+# Сессии Telegram — содержат ключи авторизации аккаунта
+session*.json
+
+# Выгруженные данные чатов
+/exports/
+
+# Редакторы и IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Мусор ОС
+.DS_Store
+.AppleDouble
+Thumbs.db
+desktop.ini
