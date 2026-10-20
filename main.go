@@ -102,6 +102,31 @@ func gotdLogger(verbose bool) gotdlog.Logger {
 	return logslog.New(slog.New(handler))
 }
 
+type cliOptions struct {
+	useCodeAuth bool
+	verbose     bool
+	export      ExportOptions
+}
+
+func parseArgs(args []string) cliOptions {
+	var opts cliOptions
+	for _, arg := range args {
+		switch arg {
+		case "--code-auth":
+			opts.useCodeAuth = true
+		case "--verbose", "-v":
+			opts.verbose = true
+		case "--no-stickers":
+			opts.export.NoStickers = true
+		case "--no-audio":
+			opts.export.NoAudio = true
+		case "--no-media":
+			opts.export.NoMedia = true
+		}
+	}
+	return opts
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -113,18 +138,9 @@ func main() {
 		log.Fatal("❌ Укажите APP_ID и APP_HASH в .env файле")
 	}
 
-	useCodeAuth := false
-	verbose := false
-	for _, arg := range os.Args[1:] {
-		switch arg {
-		case "--code-auth":
-			useCodeAuth = true
-		case "--verbose", "-v":
-			verbose = true
-		}
-	}
+	opts := parseArgs(os.Args[1:])
 
-	if useCodeAuth && phone == "" {
+	if opts.useCodeAuth && phone == "" {
 		log.Fatal("❌ Для авторизации по коду укажите PHONE в .env")
 	}
 
@@ -157,7 +173,7 @@ func main() {
 	client := telegram.NewClient(appID, appHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: "session.json"},
 		UpdateHandler:  dispatcher,
-		Logger:         gotdLogger(verbose),
+		Logger:         gotdLogger(opts.verbose),
 		Resolver:       resolver,
 	})
 
@@ -168,7 +184,7 @@ func main() {
 		}
 
 		if !status.Authorized {
-			if useCodeAuth {
+			if opts.useCodeAuth {
 				log.Println("🔑 Авторизация по коду...")
 				flow := auth.NewFlow(terminalAuth{phone: phone}, auth.SendCodeOptions{})
 				if err := client.Auth().IfNecessary(ctx, flow); err != nil {
@@ -222,7 +238,7 @@ func main() {
 			return fmt.Errorf("создание директории экспорта: %w", err)
 		}
 
-		return ExportChat(ctx, api, selected, outDir, limit)
+		return ExportChat(ctx, api, selected, outDir, limit, opts.export)
 	}); err != nil && appCtx.Err() == nil {
 		log.Fatalf("❌ %v", err)
 	}

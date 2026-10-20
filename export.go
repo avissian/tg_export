@@ -41,12 +41,45 @@ type ForwardInfo struct {
 	Date     time.Time `json:"date"`
 }
 
+// ExportOptions управляет скачиванием файлов, не меняя содержимое JSONL.
+// Нулевые настройки разрешают скачивание всех вложений.
+type ExportOptions struct {
+	NoStickers bool
+	NoAudio    bool // Аудиофайлы, голосовые сообщения и видеокружочки.
+	NoMedia    bool
+}
+
+func (opts ExportOptions) skipDocument(doc *tg.Document) bool {
+	if opts.NoMedia || (opts.NoAudio && strings.HasPrefix(doc.MimeType, "audio/")) {
+		return true
+	}
+	// Проверяем все атрибуты независимо от classifyDocument: у видеостикера
+	// атрибут видео может идти раньше атрибута стикера.
+	for _, attr := range doc.Attributes {
+		switch a := attr.(type) {
+		case *tg.DocumentAttributeSticker:
+			if opts.NoStickers {
+				return true
+			}
+		case *tg.DocumentAttributeAudio:
+			if opts.NoAudio {
+				return true
+			}
+		case *tg.DocumentAttributeVideo:
+			if opts.NoAudio && a.RoundMessage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ExportChat экспортирует сообщения чата в директорию outDir.
 // limit — сколько последних сообщений выгрузить, 0 означает всю историю.
 // Файлы: outDir/messages.jsonl (сообщения от новых к старым),
 //
 //	outDir/media/ (фото, видео, документы и т.д.)
-func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir string, limit int) error {
+func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir string, limit int, opts ExportOptions) error {
 	msgFile, err := os.Create(filepath.Join(outDir, "messages.jsonl"))
 	if err != nil {
 		return fmt.Errorf("создание messages.jsonl: %w", err)
@@ -136,7 +169,7 @@ func ExportChat(ctx context.Context, api *tg.Client, chat ChatItem, outDir strin
 
 			// Медиа
 			if media, ok := msg.GetMedia(); ok {
-				relPath, mediaType, dlErr := downloadMedia(ctx, api, dl, media, outDir, msg.ID, chat.InputPeer)
+				relPath, mediaType, dlErr := downloadMedia(ctx, api, dl, media, outDir, msg.ID, chat.InputPeer, opts)
 				if dlErr != nil {
 					log.Printf("⚠️  Медиа для сообщения %d: %v", msg.ID, dlErr)
 				}
@@ -298,11 +331,12 @@ func messageID(m tg.MessageClass) int {
 }
 
 // downloadMedia скачивает медиафайл и возвращает относительный путь и тип.
+// Если скачивание отключено настройками — возвращает те же путь и тип без загрузки.
 // Если файл уже существует — пропускает скачивание.
 // При FILE_REFERENCE_EXPIRED перезапрашивает сообщение и повторяет попытку.
-func downloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloader, media tg.MessageMediaClass, outDir string, msgID int, peer tg.InputPeerClass) (relPath, mediaType string, err error) {
+func downloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloader, media tg.MessageMediaClass, outDir string, msgID int, peer tg.InputPeerClass, opts ExportOptions) (relPath, mediaType string, err error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		relPath, mediaType, err = doDownloadMedia(ctx, api, dl, media, outDir, msgID)
+		relPath, mediaType, err = doDownloadMedia(ctx, api, dl, media, outDir, msgID, opts)
 		if err == nil || !tgerr.Is(err, "FILE_REFERENCE_EXPIRED") || attempt > 0 {
 			return
 		}
@@ -358,7 +392,7 @@ func refreshMedia(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, m
 }
 
 // doDownloadMedia — одна попытка скачать медиа (без retry по file reference)
-func doDownloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloader, media tg.MessageMediaClass, outDir string, msgID int) (relPath, mediaType string, err error) {
+func doDownloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloader, media tg.MessageMediaClass, outDir string, msgID int, opts ExportOptions) (relPath, mediaType string, err error) {
 	mediaDir := filepath.Join(outDir, "media")
 
 	switch m := media.(type) {
@@ -369,6 +403,9 @@ func doDownloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloa
 		}
 		thumbSize := bestPhotoThumb(photo.Sizes)
 		filename := fmt.Sprintf("photo_%d_%s.jpg", msgID, thumbSize)
+		if opts.NoMedia {
+			return filepath.Join("media", filename), "photo", nil
+		}
 		filePath := filepath.Join(mediaDir, filename)
 
 		if _, statErr := os.Stat(filePath); os.IsNotExist(statErr) {
@@ -391,6 +428,9 @@ func doDownloadMedia(ctx context.Context, api *tg.Client, dl *downloader.Downloa
 		}
 		mt := classifyDocument(doc)
 		filename := extractDocFilename(doc, msgID)
+		if opts.skipDocument(doc) {
+			return filepath.Join("media", filename), mt, nil
+		}
 		filePath := filepath.Join(mediaDir, filename)
 
 		if _, statErr := os.Stat(filePath); os.IsNotExist(statErr) {
